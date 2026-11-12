@@ -1,0 +1,85 @@
+# Copy to .github/workflows/ci.yml in your Salesforce DX repo.
+# Multi-stage CI so the dashboard's live pipeline view has stages to build:
+#   Lint ─┬─ LWC unit tests ─┬─ Build package
+#         └─ Apex code scan ─┘
+name: CI
+
+on:
+  push:
+    branches: [main, develop, qa, uat]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      skip_scan:
+        description: 'Skip the Apex code scan'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: ESLint
+        run: npx eslint "force-app/**/{aura,lwc}/**/*.js" --max-warnings 0
+      - name: Prettier check
+        run: npx prettier --check "force-app/**/*.{cls,trigger,js,html,css,xml}"
+
+  unit-tests:
+    name: LWC Unit Tests (Jest)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Run Jest
+        run: npx sfdx-lwc-jest --coverage
+
+  code-scan:
+    name: Apex Code Scan
+    needs: lint
+    if: ${{ !inputs.skip_scan }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Run Code Analyzer
+        run: |
+          sf plugins install code-analyzer
+          sf code-analyzer run --workspace force-app --output-file results.sarif
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: code-analyzer
+          path: results.sarif
+
+  build:
+    name: Build Package
+    needs: [unit-tests, code-scan]
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Convert source to metadata format
+        run: sf project convert source --output-dir mdapi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metadata
+          path: mdapi
