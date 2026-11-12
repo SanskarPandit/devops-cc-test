@@ -45,6 +45,8 @@ concurrency:
   cancel-in-progress: false
 
 # Inputs reach scripts through env vars (never interpolated into shell code).
+# Deploys use --ignore-conflicts: the repository is the source of truth, and scratch
+# orgs' source tracking would otherwise block CI with "changes in the org conflict".
 env:
   TEST_LEVEL: ${{ inputs.test_level || 'RunLocalTests' }}
   TESTS: ${{ inputs.tests || '' }}
@@ -81,6 +83,10 @@ jobs:
 
   deploy-qa:
     name: Deploy & test QA
+    # One deployment per org at a time (pushes to several branches queue up instead of colliding).
+    concurrency:
+      group: sf-org-qa
+      cancel-in-progress: false
     needs: validate
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
@@ -104,12 +110,16 @@ jobs:
           fi
           echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
       - name: sf project deploy start (QA)
-        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 60
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --ignore-conflicts --wait 60
       - name: Run Apex tests with coverage
         run: sf apex run test --target-org target $TEST_ARGS --code-coverage --result-format human --wait 60
 
   deploy-uat:
     name: Deploy to UAT
+    # One deployment per org at a time (pushes to several branches queue up instead of colliding).
+    concurrency:
+      group: sf-org-uat
+      cancel-in-progress: false
     needs: deploy-qa
     if: ${{ !inputs.dry_run && (github.ref_name == 'uat' || github.ref_name == 'main' || inputs.target == 'uat' || inputs.target == 'production') }}
     runs-on: ubuntu-latest
@@ -133,10 +143,14 @@ jobs:
           fi
           echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
       - name: sf project deploy start (UAT)
-        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 60
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --ignore-conflicts --wait 60
 
   deploy-production:
     name: Deploy to Production
+    # One deployment per org at a time (pushes to several branches queue up instead of colliding).
+    concurrency:
+      group: sf-org-production
+      cancel-in-progress: false
     needs: deploy-uat
     if: ${{ !inputs.dry_run && (github.ref_name == 'main' || inputs.target == 'production') }}
     runs-on: ubuntu-latest
@@ -160,4 +174,4 @@ jobs:
           fi
           echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
       - name: sf project deploy start (Production)
-        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 90
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --ignore-conflicts --wait 90
