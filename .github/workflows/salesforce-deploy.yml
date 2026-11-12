@@ -1,0 +1,115 @@
+# Copy to .github/workflows/salesforce-deploy.yml.
+#
+# Validate → Apex tests → Deploy UAT → Deploy Production (approval gate).
+# Uses GitHub Environments, so the dashboard shows real Deployments, per-
+# environment status, DORA metrics and the "Approve / Reject" buttons.
+#
+# One-time setup in GitHub → Settings:
+#   Environments:  create "qa", "uat", "production".
+#                  On "production" add Required reviewers (yourself).
+#   Secrets (per environment): SFDX_AUTH_URL
+#     Get it locally with:  sf org display --target-org <alias> --verbose --json
+#     and copy result.sfdxAuthUrl  (force://…). Treat it like a password.
+name: Salesforce Deploy
+
+on:
+  push:
+    branches: [main, uat, qa, develop]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target org'
+        required: true
+        default: qa
+        type: choice
+        options:
+          - qa
+          - uat
+          - production
+      test_level:
+        description: 'Apex test level'
+        type: choice
+        default: RunLocalTests
+        options:
+          - RunLocalTests
+          - RunSpecifiedTests
+      dry_run:
+        description: 'Validate only (no deploy)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: sf-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TEST_LEVEL: ${{ inputs.test_level || 'RunLocalTests' }}
+
+jobs:
+  validate:
+    name: Validate (check-only)
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Authenticate QA org
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias target
+          rm auth.txt
+      - name: sf project deploy validate
+        run: sf project deploy validate --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 60
+
+  apex-tests:
+    name: Apex Tests
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Authenticate QA org
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias target
+          rm auth.txt
+      - name: Run Apex tests
+        run: sf apex run test --target-org target --test-level "$TEST_LEVEL" --code-coverage --result-format human --wait 60
+
+  deploy-uat:
+    name: Deploy to UAT
+    needs: apex-tests
+    if: ${{ !inputs.dry_run && (github.ref_name == 'uat' || github.ref_name == 'main' || inputs.target == 'uat' || inputs.target == 'production') }}
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Authenticate UAT org
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias target
+          rm auth.txt
+      - name: sf project deploy start
+        run: sf project deploy start --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 60
+
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-uat
+    if: ${{ !inputs.dry_run && (github.ref_name == 'main' || inputs.target == 'production') }}
+    runs-on: ubuntu-latest
+    environment: production   # Required reviewers → run pauses until approved in the dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+      - name: Authenticate Production
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --alias target
+          rm auth.txt
+      - name: sf project deploy start
+        run: sf project deploy start --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 90
