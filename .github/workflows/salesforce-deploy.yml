@@ -1,15 +1,13 @@
-# Copy to .github/workflows/salesforce-deploy.yml.
+# Salesforce Deploy — added by DevOps Command Center (or copy to .github/workflows/).
 #
-# Validate → Apex tests → Deploy UAT → Deploy Production (approval gate).
+#   Validate (check-only, QA) → Deploy & test QA → Deploy to UAT → Deploy to Production (approval gate)
+#
 # Uses GitHub Environments, so the dashboard shows real Deployments, per-
 # environment status, DORA metrics and the "Approve / Reject" buttons.
 #
-# One-time setup in GitHub → Settings:
-#   Environments:  create "qa", "uat", "production".
-#                  On "production" add Required reviewers (yourself).
-#   Secrets (per environment): SFDX_AUTH_URL
-#     Get it locally with:  sf org display --target-org <alias> --verbose --json
-#     and copy result.sfdxAuthUrl  (force://…). Treat it like a password.
+# One-time setup (the dashboard's Setup guide does all of this for you):
+#   Environments: "qa", "uat", "production" (production: Required reviewers).
+#   Secret per environment: SFDX_AUTH_URL  (`sf org auth show-sfdx-auth-url --target-org <alias>`).
 name: Salesforce Deploy
 
 on:
@@ -18,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target org'
+        description: 'How far to deploy'
         required: true
         default: qa
         type: choice
@@ -33,6 +31,10 @@ on:
         options:
           - RunLocalTests
           - RunSpecifiedTests
+      tests:
+        description: 'Test classes for RunSpecifiedTests (comma-separated, e.g. GreetingServiceTest)'
+        type: string
+        default: ''
       dry_run:
         description: 'Validate only (no deploy)'
         type: boolean
@@ -42,8 +44,10 @@ concurrency:
   group: sf-deploy-${{ github.ref }}
   cancel-in-progress: false
 
+# Inputs reach scripts through env vars (never interpolated into shell code).
 env:
   TEST_LEVEL: ${{ inputs.test_level || 'RunLocalTests' }}
+  TESTS: ${{ inputs.tests || '' }}
 
 jobs:
   validate:
@@ -55,32 +59,58 @@ jobs:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
       - name: Authenticate QA org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          printf '%s' "$SFDX_AUTH_URL" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --alias target
           rm auth.txt
+      - name: Prepare test arguments
+        run: |
+          args="--test-level $TEST_LEVEL"
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+            if [ -z "$TESTS" ]; then
+              echo "::error::test_level is RunSpecifiedTests — list test classes in the 'tests' input (e.g. GreetingServiceTest)"
+              exit 1
+            fi
+            for t in $(echo "$TESTS" | tr ',' ' '); do args="$args --tests $t"; done
+          fi
+          echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
       - name: sf project deploy validate
-        run: sf project deploy validate --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 60
+        run: sf project deploy validate --source-dir force-app --target-org target $TEST_ARGS --wait 60
 
-  apex-tests:
-    name: Apex Tests
+  deploy-qa:
+    name: Deploy & test QA
     needs: validate
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     environment: qa
     steps:
+      - uses: actions/checkout@v4
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
       - name: Authenticate QA org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          printf '%s' "$SFDX_AUTH_URL" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --alias target
           rm auth.txt
-      - name: Run Apex tests
-        run: sf apex run test --target-org target --test-level "$TEST_LEVEL" --code-coverage --result-format human --wait 60
+      - name: Prepare test arguments
+        run: |
+          args="--test-level $TEST_LEVEL"
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+            for t in $(echo "$TESTS" | tr ',' ' '); do args="$args --tests $t"; done
+          fi
+          echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
+      - name: sf project deploy start (QA)
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 60
+      - name: Run Apex tests with coverage
+        run: sf apex run test --target-org target $TEST_ARGS --code-coverage --result-format human --wait 60
 
   deploy-uat:
     name: Deploy to UAT
-    needs: apex-tests
+    needs: deploy-qa
     if: ${{ !inputs.dry_run && (github.ref_name == 'uat' || github.ref_name == 'main' || inputs.target == 'uat' || inputs.target == 'production') }}
     runs-on: ubuntu-latest
     environment: uat
@@ -89,12 +119,21 @@ jobs:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
       - name: Authenticate UAT org
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          printf '%s' "$SFDX_AUTH_URL" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --alias target
           rm auth.txt
-      - name: sf project deploy start
-        run: sf project deploy start --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 60
+      - name: Prepare test arguments
+        run: |
+          args="--test-level $TEST_LEVEL"
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+            for t in $(echo "$TESTS" | tr ',' ' '); do args="$args --tests $t"; done
+          fi
+          echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
+      - name: sf project deploy start (UAT)
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 60
 
   deploy-production:
     name: Deploy to Production
@@ -107,9 +146,18 @@ jobs:
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
       - name: Authenticate Production
+        env:
+          SFDX_AUTH_URL: ${{ secrets.SFDX_AUTH_URL }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL }}" > auth.txt
+          printf '%s' "$SFDX_AUTH_URL" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --alias target
           rm auth.txt
-      - name: sf project deploy start
-        run: sf project deploy start --source-dir force-app --target-org target --test-level "$TEST_LEVEL" --wait 90
+      - name: Prepare test arguments
+        run: |
+          args="--test-level $TEST_LEVEL"
+          if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+            for t in $(echo "$TESTS" | tr ',' ' '); do args="$args --tests $t"; done
+          fi
+          echo "TEST_ARGS=$args" >> "$GITHUB_ENV"
+      - name: sf project deploy start (Production)
+        run: sf project deploy start --source-dir force-app --target-org target $TEST_ARGS --wait 90
